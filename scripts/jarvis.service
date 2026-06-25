@@ -1,0 +1,18 @@
+[Unit]
+Description=JARVIS AI Assistant
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/jarvis
+ExecStart=/home/%i/jarvis/.venv/bin/python main.py --mode all
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
