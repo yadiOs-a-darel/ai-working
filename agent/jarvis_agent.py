@@ -11,7 +11,7 @@ from loguru import logger
 
 from agent.prompts import get_compact_system_prompt, get_system_prompt
 from config.settings import settings
-from core.llm import get_llm_client
+from core.llm import estimate_num_predict, get_llm_client
 from memory.long_term import get_long_term_memory
 from memory.short_term import ShortTermMemory
 from tools.registry import get_all_tools
@@ -20,16 +20,33 @@ _agent_instance: Optional["JarvisAgent"] = None
 
 
 class JarvisAgent:
-    def __init__(self, session_id: str = "default") -> None:
+    def __init__(self, session_id: str = "default", minimal: bool = False) -> None:
         self.session_id = session_id
+        self.minimal = minimal
         self.llm_client = get_llm_client()
         self.memory = ShortTermMemory(session_id)
-        self.long_term = get_long_term_memory()
-        self.tools = get_all_tools()
+        self._long_term = None
+        self.tools = [] if minimal else get_all_tools()
         self._executor: Optional[AgentExecutor] = None
-        self._build_agent()
+        if not minimal:
+            self._build_agent()
+
+    @property
+    def long_term(self):
+        if self._long_term is None and (
+            settings.memory_search_enabled or settings.memory_save_enabled
+        ):
+            self._long_term = get_long_term_memory()
+        return self._long_term
 
     def _build_agent(self, system_prompt: str | None = None) -> None:
+        if self.minimal or not settings.agent_tools_enabled:
+            self._executor = None
+            return
+
+        if not self.tools:
+            self.tools = get_all_tools()
+
         system_prompt = system_prompt or get_system_prompt()
         if not self.llm_client.model_supports_tools():
             self._executor = None
@@ -79,17 +96,25 @@ class JarvisAgent:
             }
         )
 
+    def _memory_context(self, user_input: str) -> str:
+        if not settings.memory_search_enabled or self.long_term is None:
+            return ""
+        return self.long_term.get_relevant_context(user_input)
+
+    def _save_exchange(self, user_input: str, response: str) -> None:
+        if not settings.memory_save_enabled or self.long_term is None:
+            return
+        self.long_term.save_exchange(user_input, response)
+
     def chat(self, user_input: str, vocal_mode: bool = False) -> str:
         """Retourne la réponse texte de l'agent."""
         start = time.perf_counter()
-        context = self.long_term.get_relevant_context(user_input)
-        system_with_context = get_system_prompt(vocal_mode, context)
-        self._build_agent(system_with_context)
-
-        use_agent = (
-            settings.agent_tools_enabled
-            and self._executor is not None
-        )
+        context = self._memory_context(user_input)
+        use_agent = False
+        if not self.minimal and settings.agent_tools_enabled:
+            system_with_context = get_system_prompt(vocal_mode, context)
+            self._build_agent(system_with_context)
+            use_agent = self._executor is not None
 
         try:
             if use_agent:
@@ -119,7 +144,7 @@ class JarvisAgent:
 
             self.memory.add_user_message(user_input)
             self.memory.add_ai_message(response)
-            self.long_term.save_exchange(user_input, response)
+            self._save_exchange(user_input, response)
 
             return response
         except TimeoutError as exc:
@@ -139,7 +164,35 @@ class JarvisAgent:
                     return str(fallback_exc)
                 return f"Désolé, une erreur s'est produite : {fallback_exc}"
 
-    def _simple_chat(self, user_input: str, system_prompt: str) -> str:
+    def chat_stream_tokens(
+        self, user_input: str, vocal_mode: bool = False
+    ) -> Iterator[str]:
+        """Stream la réponse token par token (mode chat simple uniquement)."""
+        context = self._memory_context(user_input)
+        compact_prompt = get_compact_system_prompt(context)
+        messages = self._build_chat_messages(user_input, compact_prompt)
+        num_predict = estimate_num_predict(user_input)
+
+        full_response = ""
+        try:
+            for token in self.llm_client.chat_local_stream(
+                messages, num_predict=num_predict
+            ):
+                full_response += token
+                yield token
+        except Exception:
+            logger.exception("Erreur streaming, fallback chat bloquant")
+            fallback = self.chat(user_input, vocal_mode=vocal_mode)
+            yield fallback
+            return
+
+        self.memory.add_user_message(user_input)
+        self.memory.add_ai_message(full_response)
+        self._save_exchange(user_input, full_response)
+
+    def _build_chat_messages(
+        self, user_input: str, system_prompt: str
+    ) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
         ]
@@ -147,11 +200,16 @@ class JarvisAgent:
             role = "user" if msg["role"] == "user" else "assistant"
             messages.append({"role": role, "content": msg["content"]})
         messages.append({"role": "user", "content": user_input})
-        return self.llm_client.chat_local(messages)
+        return messages
+
+    def _simple_chat(self, user_input: str, system_prompt: str) -> str:
+        messages = self._build_chat_messages(user_input, system_prompt)
+        num_predict = estimate_num_predict(user_input)
+        return self.llm_client.chat_local(messages, num_predict=num_predict)
 
     def chat_stream(self, user_input: str) -> Iterator[str]:
         """Stream token par token."""
-        context = self.long_term.get_relevant_context(user_input)
+        context = self._memory_context(user_input)
         system_prompt = get_system_prompt(extra_context=context)
         model = self.llm_client.chat_model
 
@@ -176,11 +234,15 @@ class JarvisAgent:
 
         self.memory.add_user_message(user_input)
         self.memory.add_ai_message(full_response)
-        self.long_term.save_exchange(user_input, full_response)
+        self._save_exchange(user_input, full_response)
 
 
-def get_jarvis_agent(session_id: str = "default") -> JarvisAgent:
+def get_jarvis_agent(session_id: str = "default", minimal: bool = False) -> JarvisAgent:
     global _agent_instance
-    if _agent_instance is None or _agent_instance.session_id != session_id:
-        _agent_instance = JarvisAgent(session_id)
+    if (
+        _agent_instance is None
+        or _agent_instance.session_id != session_id
+        or _agent_instance.minimal != minimal
+    ):
+        _agent_instance = JarvisAgent(session_id, minimal=minimal)
     return _agent_instance

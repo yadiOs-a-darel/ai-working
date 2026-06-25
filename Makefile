@@ -22,7 +22,7 @@ start-api:
 	$(RUN) uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 
 start-ui:
-	$(RUN) python ui/dashboard.py
+	$(RUN) python main.py --mode ui
 
 test:
 	$(RUN) pytest tests/ -v

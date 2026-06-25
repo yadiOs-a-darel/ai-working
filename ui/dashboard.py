@@ -1,7 +1,5 @@
 """Interface Gradio JARVIS."""
 
-import threading
-import time
 from pathlib import Path
 
 import gradio as gr
@@ -11,8 +9,6 @@ from loguru import logger
 from agent.jarvis_agent import get_jarvis_agent
 from config.settings import settings
 from core.llm import get_llm_client
-from core.tts import get_tts_engine
-from core.wake_word import get_wake_word_detector
 from memory.notes import get_notes_manager
 from memory.short_term import ShortTermMemory
 
@@ -26,14 +22,8 @@ def chat_fn(message: str, history: list) -> str:
     if not message.strip():
         return ""
     try:
-        agent = get_jarvis_agent()
+        agent = get_jarvis_agent(minimal=True)
         response = agent.chat(message)
-        if settings.speak_responses and response.strip():
-            threading.Thread(
-                target=get_tts_engine().speak,
-                args=(response,),
-                daemon=True,
-            ).start()
         return response
     except Exception as exc:
         logger.exception("Erreur chat Gradio")
@@ -47,16 +37,13 @@ def get_status_html() -> str:
         ollama_ok = info["ollama_available"]
         color = "#00ff88" if ollama_ok else "#ff4444"
         status_text = "En ligne" if ollama_ok else "Hors ligne"
-        wake = get_wake_word_detector()
-        wake_status = "ON" if wake.is_active and _wake_word_enabled else "OFF"
         return f"""
         <div style="padding: 10px;">
             <h3>Statut système</h3>
             <p><b>LLM :</b> {info['model']} 
                <span style="color:{color}">● {status_text}</span></p>
             <p><b>Provider :</b> {info['provider']}</p>
-            <p><b>Wake word :</b> {wake_status}</p>
-            <p><b>Micro :</b> niveau {_mic_level:.2f}</p>
+            <p><b>Mode :</b> interface web</p>
         </div>
         """
     except Exception as exc:
@@ -164,10 +151,11 @@ def create_dashboard() -> gr.Blocks:
 def start_ui() -> None:
     demo = create_dashboard()
     demo.launch(
-        server_name=settings.api_host,
+        server_name="127.0.0.1",
         server_port=settings.ui_port,
         share=False,
         show_error=True,
+        inbrowser=False,
     )
 
 

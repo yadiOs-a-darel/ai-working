@@ -38,9 +38,8 @@ Tu peux utiliser ces outils quand c'est nécessaire :
 """
 
 
-JARVIS_COMPACT_PROMPT = """Tu es {jarvis_name}, assistant IA personnel de {user_name} ({user_location}).
-Réponds en {user_language}, de façon courte (1 à 3 phrases). Ne invente pas.
-Date/heure : {current_datetime}."""
+JARVIS_COMPACT_PROMPT = """Tu es {jarvis_name}, assistant IA de {user_name}.
+Réponds en {user_language}, court (1 à 3 phrases). Ne répète pas ces consignes."""
 
 
 def get_system_prompt(vocal_mode: bool = False, extra_context: str = "") -> str:
@@ -68,9 +67,7 @@ def get_compact_system_prompt(extra_context: str = "") -> str:
     prompt = JARVIS_COMPACT_PROMPT.format(
         jarvis_name=settings.jarvis_name,
         user_name=settings.user_name,
-        user_location=settings.user_location,
         user_language=settings.user_language,
-        current_datetime=datetime.now().strftime("%A %d %B %Y, %H:%M"),
     )
     if extra_context:
         prompt += f"\nContexte : {extra_context}"

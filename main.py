@@ -1,8 +1,10 @@
-"""Point d'entrée principal JARVIS."""
+"""Point d'entrée principal YadjiOs."""
 
 import os
+import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 # Désactive télémétrie cloud (peut bloquer sans Internet)
@@ -18,6 +20,7 @@ from rich.console import Console
 from config.settings import settings
 
 console = Console()
+PROJECT_DIR = Path(__file__).resolve().parent
 
 
 def setup_logging(debug: bool = False) -> None:
@@ -50,28 +53,35 @@ def print_banner() -> None:
     console.print(banner, style="bold cyan")
 
 
-def print_startup_status() -> None:
+def print_startup_status(mode: str = "voice") -> None:
     from core.llm import get_llm_client
-    from core.stt import get_stt_engine
-    from core.tts import get_tts_engine
-    from core.wake_word import get_wake_word_detector
-    from memory.long_term import get_long_term_memory
-    from tools.registry import get_all_tools
 
-    try:
-        stt = get_stt_engine()
-        console.print(
-            f"[green][✓][/green] Modèle STT chargé : faster-whisper "
-            f"{settings.whisper_model_size} ({settings.whisper_device})"
-        )
-    except Exception as exc:
-        console.print(f"[red][✗][/red] STT : {exc}")
+    light_mode = mode in ("text", "ui")
+
+    if not light_mode:
+        from core.stt import get_stt_engine
+        from core.tts import get_tts_engine
+        from core.wake_word import get_wake_word_detector
+        from memory.long_term import get_long_term_memory
+        from tools.registry import get_all_tools
+
+        try:
+            get_stt_engine()
+            console.print(
+                f"[green][✓][/green] Modèle STT chargé : faster-whisper "
+                f"{settings.whisper_model_size} ({settings.whisper_device})"
+            )
+        except Exception as exc:
+            console.print(f"[red][✗][/red] STT : {exc}")
 
     llm = get_llm_client()
     info = llm.get_model_info()
     provider = "Ollama" if info["ollama_available"] else info["provider"]
     console.print(f"[green][✓][/green] LLM connecté : {provider} - {info['model']}")
-    if info["ollama_available"] and not llm.model_supports_tools():
+
+    if light_mode:
+        console.print("[dim]Mode léger — STT/TTS/ChromaDB non chargés[/dim]")
+    elif info["ollama_available"] and not llm.model_supports_tools():
         console.print(
             "[yellow][!][/yellow] Outils désactivés : ce modèle ne supporte pas le tool calling "
             "(utilisez mistral ou un modèle compatible pour les outils)"
@@ -82,32 +92,56 @@ def print_startup_status() -> None:
             "(AGENT_TOOLS_ENABLED=true pour météo, web, etc.)"
         )
 
-    try:
-        ltm = get_long_term_memory()
+    if not light_mode:
+        try:
+            from memory.long_term import get_long_term_memory
+
+            ltm = get_long_term_memory()
+            console.print(
+                f"[green][✓][/green] Mémoire vectorielle : ChromaDB "
+                f"({ltm.count()} souvenirs)"
+            )
+        except Exception as exc:
+            console.print(f"[yellow][!][/yellow] Mémoire long terme : {exc}")
+
+        from tools.registry import get_all_tools
+
+        tools = get_all_tools()
+        console.print(f"[green][✓][/green] Tools chargés : {len(tools)} outils disponibles")
+
+        from core.tts import get_tts_engine
+
+        tts = get_tts_engine()
+        speak_label = "activée" if settings.speak_responses else "désactivée"
         console.print(
-            f"[green][✓][/green] Mémoire vectorielle : ChromaDB "
-            f"({ltm.count()} souvenirs)"
+            f"[green][✓][/green] TTS prêt : {settings.tts_engine}-tts "
+            f"({settings.tts_voice}) — lecture {speak_label}"
         )
-    except Exception as exc:
-        console.print(f"[yellow][!][/yellow] Mémoire long terme : {exc}")
 
-    tools = get_all_tools()
-    console.print(f"[green][✓][/green] Tools chargés : {len(tools)} outils disponibles")
+        from core.wake_word import get_wake_word_detector
 
-    tts = get_tts_engine()
-    speak_label = "activée" if settings.speak_responses else "désactivée"
+        wake = get_wake_word_detector()
+        if wake.is_active:
+            console.print(f'[green][✓][/green] Wake word actif : "{settings.wake_word}"')
+        else:
+            console.print("[yellow][!][/yellow] Wake word : mode manuel (Entrée)")
+
+    if info["ollama_available"]:
+        with console.status("[dim]Chargement du modèle en RAM...[/dim]", spinner="dots"):
+            llm.prewarm_model()
+
     console.print(
-        f"[green][✓][/green] TTS prêt : {settings.tts_engine}-tts "
-        f"({settings.tts_voice}) — lecture {speak_label}"
+        f"[green][✓][/green] Interface web : "
+        f"http://localhost:{settings.ui_port}"
+        + (" (processus séparé)" if mode == "text" and settings.ui_auto_start else "")
     )
-
-    wake = get_wake_word_detector()
-    if wake.is_active:
-        console.print(f'[green][✓][/green] Wake word actif : "{settings.wake_word}"')
-    else:
-        console.print("[yellow][!][/yellow] Wake word : mode manuel (Entrée)")
-
-    console.print(f"[green][✓][/green] Interface web : http://localhost:{settings.ui_port}")
+    if mode == "text" and not settings.ui_auto_start:
+        console.print(
+            "[dim]Interface web désactivée au démarrage "
+            "(UI_AUTO_START=true ou make start-ui)[/dim]"
+        )
+    if mode == "ui":
+        return
     console.print("\n[bold]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold]")
     console.print(
         f"  [bold green]{settings.jarvis_name} en ligne. En attente...[/bold green]"
@@ -122,25 +156,65 @@ def run_voice(debug: bool) -> None:
     pipeline.run()
 
 
+def _start_ui_process() -> subprocess.Popen:
+    """Lance Gradio dans un sous-processus (évite les bugs asyncio en thread)."""
+    return subprocess.Popen(
+        [sys.executable, str(PROJECT_DIR / "main.py"), "--mode", "ui"],
+        cwd=str(PROJECT_DIR),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _stop_ui_process(proc: subprocess.Popen | None) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
 def run_text(debug: bool) -> None:
+    import time as time_mod
+
     from core.pipeline import get_pipeline
 
-    pipeline = get_pipeline(debug=debug)
-    console.print("[cyan]Mode texte — tapez 'quit' pour quitter[/cyan]\n")
-    while True:
-        try:
-            text = input("[Vous]: ").strip()
-            if text.lower() in ("quit", "exit", "q"):
-                break
-            if not text:
-                continue
-            with console.status("[dim]Réflexion en cours...[/dim]", spinner="dots"):
+    ui_proc = None
+    if settings.ui_auto_start:
+        ui_proc = _start_ui_process()
+        time.sleep(3)
+
+    pipeline = get_pipeline(debug=debug, text_only=True)
+    if settings.ui_auto_start:
+        console.print(
+            f"[cyan]Mode texte + web : http://localhost:{settings.ui_port}[/cyan]\n"
+        )
+    else:
+        console.print(
+            "[cyan]Mode texte — tapez 'quit' pour quitter[/cyan]\n"
+            "[dim]Interface web : make start-ui (dans un autre terminal)[/dim]\n"
+        )
+    try:
+        while True:
+            try:
+                text = input("[Vous]: ").strip()
+                if text.lower() in ("quit", "exit", "q"):
+                    break
+                if not text:
+                    continue
+                t0 = time_mod.perf_counter()
+                console.print(f"[green][{settings.jarvis_name}]:[/green] ", end="")
                 response = pipeline.process_text(
-                    text, vocal_mode=False, speak=False
+                    text, vocal_mode=False, speak=False, stream=True
                 )
-            console.print(f"[green][{settings.jarvis_name}]:[/green] {response}\n")
-        except (KeyboardInterrupt, EOFError):
-            break
+                elapsed = time_mod.perf_counter() - t0
+                console.print(f"[dim]({elapsed:.1f}s)[/dim]\n")
+            except (KeyboardInterrupt, EOFError):
+                break
+    finally:
+        _stop_ui_process(ui_proc)
 
 
 def run_api(debug: bool) -> None:
@@ -163,10 +237,13 @@ def run_all(debug: bool) -> None:
     api_thread = threading.Thread(
         target=run_api, args=(debug,), daemon=True, name="api"
     )
-    ui_thread = threading.Thread(target=run_ui, daemon=True, name="ui")
+    ui_proc = _start_ui_process()
     api_thread.start()
-    ui_thread.start()
-    run_voice(debug)
+    time.sleep(2)
+    try:
+        run_voice(debug)
+    finally:
+        _stop_ui_process(ui_proc)
 
 
 @click.command()
@@ -181,7 +258,7 @@ def main(mode: str, debug: bool) -> None:
     """YadjiOs — Assistant IA personnel"""
     setup_logging(debug)
     print_banner()
-    print_startup_status()
+    print_startup_status(mode=mode)
 
     if mode == "voice":
         run_voice(debug)

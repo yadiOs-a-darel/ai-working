@@ -20,23 +20,33 @@ _pipeline_instance: Optional["JarvisPipeline"] = None
 
 
 class JarvisPipeline:
-    def __init__(self, debug: bool = False) -> None:
+    def __init__(self, debug: bool = False, text_only: bool = False) -> None:
         self.debug = debug
-        self.audio = AudioCapture()
-        self.stt = get_stt_engine()
-        self.agent = get_jarvis_agent()
-        self.tts = get_tts_engine()
-        self.wake_word = get_wake_word_detector()
-        self.long_term = get_long_term_memory()
+        self.text_only = text_only
+        self.audio = None if text_only else AudioCapture()
+        self.stt = None if text_only else get_stt_engine()
+        self.agent = get_jarvis_agent(minimal=text_only)
+        self.tts = None if text_only else get_tts_engine()
+        self.wake_word = None if text_only else get_wake_word_detector()
+        self.long_term = None if text_only else get_long_term_memory()
         self.is_running = False
 
     def process_text(
-        self, text: str, vocal_mode: bool = False, speak: bool | None = None
+        self, text: str, vocal_mode: bool = False, speak: bool | None = None,
+        stream: bool = False,
     ) -> str:
         """Traite une entrée texte et lit la réponse si demandé."""
         if not text.strip():
             return ""
-        response = self.agent.chat(text, vocal_mode=vocal_mode)
+        if stream and self.text_only:
+            parts: list[str] = []
+            for token in self.agent.chat_stream_tokens(text, vocal_mode=vocal_mode):
+                console.print(token, end="", highlight=False)
+                parts.append(token)
+            console.print()
+            response = "".join(parts)
+        else:
+            response = self.agent.chat(text, vocal_mode=vocal_mode)
         should_speak = speak if speak is not None else settings.speak_responses
         if should_speak and response.strip():
             self.tts.speak(response)
@@ -114,8 +124,8 @@ class JarvisPipeline:
         self.wake_word.stop()
 
 
-def get_pipeline(debug: bool = False) -> JarvisPipeline:
+def get_pipeline(debug: bool = False, text_only: bool = False) -> JarvisPipeline:
     global _pipeline_instance
-    if _pipeline_instance is None:
-        _pipeline_instance = JarvisPipeline(debug=debug)
+    if _pipeline_instance is None or _pipeline_instance.text_only != text_only:
+        _pipeline_instance = JarvisPipeline(debug=debug, text_only=text_only)
     return _pipeline_instance

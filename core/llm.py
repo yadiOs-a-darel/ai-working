@@ -1,7 +1,7 @@
 """Client LLM avec Ollama local et fallback OpenAI."""
 
-import threading
-from typing import Any, Optional
+import json
+from typing import Any, Iterator, Optional
 
 import requests
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -10,6 +10,17 @@ from loguru import logger
 from config.settings import settings
 
 _llm_instance: Optional["LLMClient"] = None
+
+
+def estimate_num_predict(user_input: str, cap: int | None = None) -> int:
+    """Limite les tokens générés selon la longueur de la question."""
+    cap = cap or settings.ollama_num_predict
+    words = len(user_input.split())
+    if words <= 3:
+        return min(cap, 48)
+    if words <= 12:
+        return min(cap, 96)
+    return cap
 
 
 class LLMClient:
@@ -89,60 +100,118 @@ class LLMClient:
 
         return self._tools_supported
 
+    def _chat_payload(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        stream: bool = False,
+        num_predict: int | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "model": settings.ollama_model,
+            "messages": messages,
+            "stream": stream,
+            "keep_alive": settings.ollama_keep_alive,
+            "options": {
+                "num_ctx": settings.ollama_num_ctx,
+                "num_predict": num_predict or settings.ollama_num_predict,
+            },
+        }
+
     def chat_local(
         self,
         messages: list[dict[str, str]],
         timeout: int | None = None,
+        num_predict: int | None = None,
     ) -> str:
         """Appel direct à Ollama local (évite LangChain et le cloud)."""
         if not self._ollama_available:
             raise RuntimeError("Ollama indisponible sur " + settings.ollama_base_url)
 
         timeout = timeout or settings.ollama_timeout
-        payload = {
-            "model": settings.ollama_model,
-            "messages": messages,
-            "stream": False,
-            "options": {"num_ctx": settings.ollama_num_ctx},
-        }
-        result: dict[str, str] = {}
-        errors: list[Exception] = []
+        payload = self._chat_payload(messages, num_predict=num_predict)
 
-        def _request() -> None:
-            try:
-                response = requests.post(
-                    f"{settings.ollama_base_url}/api/chat",
-                    json=payload,
-                    timeout=(10, timeout + 30),
-                )
-                response.raise_for_status()
-                content = response.json().get("message", {}).get("content", "")
-                if not content.strip():
-                    raise RuntimeError("Réponse Ollama vide")
-                result["content"] = content
-            except Exception as exc:
-                errors.append(exc)
-
-        thread = threading.Thread(target=_request, daemon=True)
-        thread.start()
-        thread.join(timeout=timeout)
-
-        if thread.is_alive():
+        try:
+            response = requests.post(
+                f"{settings.ollama_base_url}/api/chat",
+                json=payload,
+                timeout=(5, timeout),
+            )
+            response.raise_for_status()
+            content = response.json().get("message", {}).get("content", "")
+            if not content.strip():
+                raise RuntimeError("Réponse Ollama vide")
+            return content
+        except requests.Timeout as exc:
             raise TimeoutError(
                 f"Ollama n'a pas répondu en {timeout}s — "
                 "essayez phi3.5 (plus rapide) ou augmentez OLLAMA_TIMEOUT."
-            )
-
-        if errors:
-            exc = errors[0]
-            if isinstance(exc, requests.Timeout):
-                raise TimeoutError(
-                    f"Ollama n'a pas répondu en {timeout}s — "
-                    "modèle trop lourd pour le CPU."
-                ) from exc
+            ) from exc
+        except requests.RequestException as exc:
             raise RuntimeError(f"Erreur Ollama : {exc}") from exc
 
-        return result["content"]
+    def chat_local_stream(
+        self,
+        messages: list[dict[str, str]],
+        timeout: int | None = None,
+        num_predict: int | None = None,
+    ) -> Iterator[str]:
+        """Stream token par token depuis Ollama (affichage progressif)."""
+        if not self._ollama_available:
+            raise RuntimeError("Ollama indisponible sur " + settings.ollama_base_url)
+
+        timeout = timeout or settings.ollama_timeout
+        payload = self._chat_payload(
+            messages, stream=True, num_predict=num_predict
+        )
+
+        try:
+            with requests.post(
+                f"{settings.ollama_base_url}/api/chat",
+                json=payload,
+                stream=True,
+                timeout=(5, timeout),
+            ) as response:
+                response.raise_for_status()
+                for raw_line in response.iter_lines(decode_unicode=True):
+                    if not raw_line:
+                        continue
+                    chunk = json.loads(raw_line)
+                    token = chunk.get("message", {}).get("content", "")
+                    if token:
+                        yield token
+                    if chunk.get("done"):
+                        break
+        except requests.Timeout as exc:
+            raise TimeoutError(
+                f"Ollama n'a pas répondu en {timeout}s — "
+                "essayez phi3.5 (plus rapide) ou augmentez OLLAMA_TIMEOUT."
+            ) from exc
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Erreur Ollama : {exc}") from exc
+
+    def prewarm_model(self) -> None:
+        """Charge le modèle Ollama en RAM avant la première question."""
+        if not self._ollama_available:
+            return
+        try:
+            requests.post(
+                f"{settings.ollama_base_url}/api/generate",
+                json={
+                    "model": settings.ollama_model,
+                    "prompt": "ok",
+                    "stream": False,
+                    "keep_alive": settings.ollama_keep_alive,
+                    "options": {
+                        "num_predict": 1,
+                        "num_ctx": settings.ollama_num_ctx,
+                    },
+                },
+                timeout=(5, settings.ollama_timeout),
+            )
+            logger.info(f"Modèle {settings.ollama_model} préchargé en RAM")
+        except Exception:
+            logger.warning("Préchargement Ollama ignoré (relance au 1er message)")
 
     @property
     def chat_model(self) -> BaseChatModel:

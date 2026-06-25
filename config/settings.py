@@ -9,9 +9,13 @@ class Settings(BaseSettings):
     ollama_model: str = "mistral"
     ollama_fallback_model: str = "phi3.5"
     ollama_timeout: int = 120
-    ollama_num_ctx: int = 2048
+    ollama_num_ctx: int = 1024
+    ollama_num_predict: int = 96
+    ollama_keep_alive: str = "30m"
     agent_tools_enabled: bool = False
     memory_search_enabled: bool = False
+    memory_save_enabled: bool = False
+    ui_auto_start: bool = False
     openai_api_key: str = ""
     anthropic_api_key: str = ""
 

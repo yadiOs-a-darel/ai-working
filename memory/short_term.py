@@ -10,7 +10,7 @@ from loguru import logger
 
 from config.settings import settings
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 _history_store: dict[str, InMemoryChatMessageHistory] = {}
 
 
