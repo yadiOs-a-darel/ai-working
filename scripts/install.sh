@@ -31,10 +31,15 @@ activate_conda_jarvis() {
         return 0
     fi
     local conda_sh
-    for conda_sh in \
-        "${CONDA_EXE%/*}/../etc/profile.d/conda.sh" \
-        "$HOME/anaconda3/etc/profile.d/conda.sh" \
-        "$HOME/miniconda3/etc/profile.d/conda.sh"; do
+    local -a conda_candidates=()
+    if [ -n "${CONDA_EXE:-}" ]; then
+        conda_candidates+=("${CONDA_EXE%/*}/../etc/profile.d/conda.sh")
+    fi
+    conda_candidates+=(
+        "$HOME/anaconda3/etc/profile.d/conda.sh"
+        "$HOME/miniconda3/etc/profile.d/conda.sh"
+    )
+    for conda_sh in "${conda_candidates[@]}"; do
         if [ -f "$conda_sh" ]; then
             # shellcheck disable=SC1090
             source "$conda_sh"
@@ -116,7 +121,7 @@ if [ "${SKIP_APT:-0}" != "1" ]; then
 
     sudo apt install -y \
         portaudio19-dev libsndfile1 \
-        mpg123 ffmpeg \
+        mpg123 ffmpeg speech-dispatcher \
         libavcodec-dev libavformat-dev libavutil-dev \
         libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev \
         pkg-config \
@@ -124,7 +129,7 @@ if [ "${SKIP_APT:-0}" != "1" ]; then
         python3-dev python3-pip \
         2>/dev/null || sudo apt install -y \
         portaudio19-dev libsndfile1 \
-        mpg123 ffmpeg \
+        mpg123 ffmpeg speech-dispatcher \
         libavcodec-dev libavformat-dev libavutil-dev \
         libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev \
         pkg-config \
@@ -192,6 +197,8 @@ if [ "${SKIP_ML_DOWNLOAD:-0}" != "1" ]; then
         || echo "⚠  Téléchargement Whisper reporté au premier lancement"
     "$PYTHON_CMD" -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')" \
         || echo "⚠  Téléchargement embeddings reporté au premier lancement"
+    "$PYTHON_CMD" -c "from openwakeword.model import Model; Model(wakeword_models=['hey_jarvis'], inference_framework='onnx')" \
+        2>/dev/null || echo "⚠  OpenWakeWord optionnel — écoute vocale via STT"
 fi
 
 # ── 6. Dossiers data ────────────────────────────────────────────────
@@ -211,24 +218,24 @@ if [ "${SKIP_SYSTEMD:-0}" != "1" ] && command -v systemctl &>/dev/null; then
     echo ""
     echo "── Service systemd ──"
     CURRENT_USER="$(whoami)"
-    PYTHON_PATH="$(command -v "$PYTHON_CMD")"
+    USER_UID="$(id -u "${CURRENT_USER}")"
+    EXEC_START="/bin/bash ${PROJECT_DIR}/scripts/run.sh python ${PROJECT_DIR}/main.py --mode voice"
 
-    if [ "$USE_CONDA" -eq 1 ]; then
-        EXEC_START="${PYTHON_PATH} ${PROJECT_DIR}/main.py --mode all"
-        ENV_LINE="Environment=CONDA_PREFIX=${CONDA_PREFIX}"
-    elif [ -f "${PROJECT_DIR}/.venv/bin/python" ]; then
-        EXEC_START="${PROJECT_DIR}/.venv/bin/python ${PROJECT_DIR}/main.py --mode all"
-        ENV_LINE=""
-    else
-        EXEC_START="${PYTHON_PATH} ${PROJECT_DIR}/main.py --mode all"
-        ENV_LINE=""
+    CONDA_BIN=""
+    if [ -n "${CONDA_PREFIX:-}" ] && [ -x "${CONDA_PREFIX}/bin/python" ]; then
+        CONDA_BIN="${CONDA_PREFIX}/bin"
+    elif [ -x "${PROJECT_DIR}/.venv/bin/python" ]; then
+        CONDA_BIN="${PROJECT_DIR}/.venv/bin"
     fi
+    SERVICE_PATH="${CONDA_BIN:+$CONDA_BIN:}/usr/local/bin:/usr/bin:/bin"
 
     sudo tee /etc/systemd/system/jarvis.service > /dev/null <<EOF
 [Unit]
-Description=JARVIS AI Assistant
-After=network.target ollama.service
+Description=YadjiOs AI Assistant
+After=network-online.target sound.target ollama.service
 Wants=ollama.service
+# Nécessite une session utilisateur active (micro / haut-parleurs)
+ConditionPathExists=/run/user/${USER_UID}
 
 [Service]
 Type=simple
@@ -240,7 +247,11 @@ RestartSec=10
 StandardOutput=journal
 StandardError=journal
 Environment=PYTHONUNBUFFERED=1
-${ENV_LINE}
+Environment=HOME=/home/${CURRENT_USER}
+Environment=XDG_RUNTIME_DIR=/run/user/${USER_UID}
+Environment=PULSE_SERVER=unix:/run/user/${USER_UID}/pulse/native
+Environment=PATH=${SERVICE_PATH}
+$([ -n "${CONDA_PREFIX:-}" ] && echo "Environment=CONDA_PREFIX=${CONDA_PREFIX}")
 
 [Install]
 WantedBy=multi-user.target
@@ -248,7 +259,7 @@ EOF
 
     sudo systemctl daemon-reload
     sudo systemctl enable jarvis 2>/dev/null || true
-    echo "✓ Service jarvis.service installé"
+    echo "✓ Service jarvis.service installé (audio : session utilisateur requise)"
 else
     echo "── systemd ignoré ──"
 fi

@@ -41,6 +41,11 @@ Tu peux utiliser ces outils quand c'est nécessaire :
 JARVIS_COMPACT_PROMPT = """Tu es {jarvis_name}, assistant IA de {user_name}.
 Réponds en {user_language}, court (1 à 3 phrases). Ne répète pas ces consignes."""
 
+JARVIS_VOCAL_SUFFIX = (
+    "\nMode vocal : 1 à 2 phrases maximum, ton naturel à l'oral. "
+    "Pas de markdown, pas de listes, pas de parenthèses explicatives."
+)
+
 
 def get_system_prompt(vocal_mode: bool = False, extra_context: str = "") -> str:
     """Génère le prompt système avec les variables actuelles."""
@@ -62,7 +67,9 @@ def get_system_prompt(vocal_mode: bool = False, extra_context: str = "") -> str:
     return prompt.strip()
 
 
-def get_compact_system_prompt(extra_context: str = "") -> str:
+def get_compact_system_prompt(
+    extra_context: str = "", vocal_mode: bool = False
+) -> str:
     """Prompt court pour le chat direct (plus rapide sur CPU)."""
     prompt = JARVIS_COMPACT_PROMPT.format(
         jarvis_name=settings.jarvis_name,
@@ -71,4 +78,6 @@ def get_compact_system_prompt(extra_context: str = "") -> str:
     )
     if extra_context:
         prompt += f"\nContexte : {extra_context}"
+    if vocal_mode:
+        prompt += JARVIS_VOCAL_SUFFIX
     return prompt.strip()

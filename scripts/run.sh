@@ -9,11 +9,21 @@ activate_conda_jarvis() {
     if [ "${CONDA_DEFAULT_ENV:-}" = "jarvis" ]; then
         return 0
     fi
+    # systemd : CONDA_PREFIX est souvent défini sans shell Conda interactif
+    if [ -n "${CONDA_PREFIX:-}" ] && [ -x "${CONDA_PREFIX}/bin/python" ]; then
+        export PATH="${CONDA_PREFIX}/bin:${PATH}"
+        return 0
+    fi
     local conda_sh
-    for conda_sh in \
-        "${CONDA_EXE%/*}/../etc/profile.d/conda.sh" \
-        "$HOME/anaconda3/etc/profile.d/conda.sh" \
-        "$HOME/miniconda3/etc/profile.d/conda.sh"; do
+    local -a conda_candidates=()
+    if [ -n "${CONDA_EXE:-}" ]; then
+        conda_candidates+=("${CONDA_EXE%/*}/../etc/profile.d/conda.sh")
+    fi
+    conda_candidates+=(
+        "$HOME/anaconda3/etc/profile.d/conda.sh"
+        "$HOME/miniconda3/etc/profile.d/conda.sh"
+    )
+    for conda_sh in "${conda_candidates[@]}"; do
         if [ -f "$conda_sh" ]; then
             # shellcheck disable=SC1090
             source "$conda_sh"

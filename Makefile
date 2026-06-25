@@ -1,4 +1,4 @@
-.PHONY: install install-conda start start-voice start-text start-api start-ui test lint clean
+.PHONY: install install-conda install-service start start-voice start-text start-api start-ui test lint clean
 
 RUN = bash scripts/run.sh
 
@@ -8,6 +8,9 @@ install:
 # Installation minimale pour environnement Conda (sans apt upgrade ni systemd)
 install-conda:
 	SKIP_APT_UPGRADE=1 SKIP_SYSTEMD=1 REQUIRE_CONDA=1 bash scripts/install.sh
+
+install-service:
+	SKIP_APT=1 SKIP_OLLAMA=1 SKIP_ML_DOWNLOAD=1 bash scripts/update-service.sh
 
 start:
 	$(RUN) python main.py

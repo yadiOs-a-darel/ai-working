@@ -56,6 +56,10 @@ class STTEngine:
                 language=settings.whisper_language,
                 beam_size=5,
                 vad_filter=True,
+                initial_prompt=(
+                    f"Bonjour. Hey {settings.jarvis_name}, qu'est-ce qu'une API, "
+                    "développement logiciel, intelligence artificielle."
+                ),
             )
             text = " ".join(seg.text.strip() for seg in segments).strip()
             duration = time.perf_counter() - start

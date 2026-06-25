@@ -31,6 +31,7 @@ class AudioCapture:
         self.device = (
             None if settings.mic_device_index < 0 else settings.mic_device_index
         )
+        self.last_speech_detected = False
 
     def _rms(self, chunk: np.ndarray) -> float:
         if chunk.size == 0:
@@ -43,9 +44,15 @@ class AudioCapture:
         silence_frames_needed = max(
             1, int(self.silence_threshold / self.chunk_duration)
         )
+        min_chunks_before_stop = max(
+            SILENCE_FRAMES_REQUIRED,
+            int(1.0 / self.chunk_duration),
+        )
         recorded: list[np.ndarray] = []
         silence_count = 0
+        speech_detected = False
         chunks_recorded = 0
+        self.last_speech_detected = False
 
         progress = Progress(
             TextColumn("[cyan]🎤 Enregistrement"),
@@ -74,12 +81,16 @@ class AudioCapture:
                         level = self._rms(chunk)
                         progress.update(task, advance=1, level=level)
 
-                        if level < RMS_THRESHOLD:
-                            silence_count += 1
-                            if silence_count >= silence_frames_needed and len(recorded) > SILENCE_FRAMES_REQUIRED:
-                                break
-                        else:
+                        if level >= RMS_THRESHOLD:
+                            speech_detected = True
                             silence_count = 0
+                        elif speech_detected:
+                            silence_count += 1
+                            if (
+                                silence_count >= silence_frames_needed
+                                and len(recorded) >= min_chunks_before_stop
+                            ):
+                                break
         except Exception:
             logger.exception("Erreur lors de l'enregistrement audio")
             raise
@@ -88,7 +99,11 @@ class AudioCapture:
             return np.array([], dtype=np.float32)
 
         audio = np.concatenate(recorded)
-        logger.debug(f"Audio enregistré : {len(audio) / self.sample_rate:.1f}s")
+        self.last_speech_detected = speech_detected
+        logger.debug(
+            f"Audio enregistré : {len(audio) / self.sample_rate:.1f}s "
+            f"(parole détectée : {speech_detected})"
+        )
         return audio
 
     def play_beep(self, frequency: int = 880, duration: float = 0.15) -> None:
@@ -98,18 +113,35 @@ class AudioCapture:
         try:
             sd.play(tone, self.sample_rate)
             sd.wait()
+            sd.sleep(0.25)
         except Exception:
             logger.warning("Impossible de jouer le bip de confirmation")
 
 
 def play_audio(audio_path: str) -> None:
-    """Joue un fichier audio (sounddevice en priorité, puis lecteur système)."""
+    """Joue un fichier audio (mp3/wav — lecteurs système en priorité)."""
     path = Path(audio_path)
     if not path.exists():
         logger.error(f"Fichier audio introuvable : {audio_path}")
         return
 
-    if path.suffix.lower() in (".wav", ".flac", ".ogg"):
+    suffix = path.suffix.lower()
+
+    if suffix == ".mp3" and shutil.which("mpg123"):
+        try:
+            subprocess.run(["mpg123", "-q", str(path)], check=True, timeout=120)
+            return
+        except Exception:
+            logger.warning("Lecture mpg123 échouée, essai suivant")
+
+    if shutil.which("paplay"):
+        try:
+            subprocess.run(["paplay", str(path)], check=True, timeout=120)
+            return
+        except Exception:
+            logger.warning("Lecture paplay échouée, essai suivant")
+
+    if suffix in (".wav", ".flac", ".ogg"):
         try:
             data, samplerate = sf.read(str(path), dtype="float32")
             if data.ndim > 1:
@@ -121,15 +153,15 @@ def play_audio(audio_path: str) -> None:
             logger.warning("Lecture sounddevice échouée, fallback lecteur externe")
 
     player = None
-    if shutil.which("mpg123"):
-        player = ["mpg123", "-q", str(path)]
+    if suffix == ".mp3" and shutil.which("ffplay"):
+        player = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)]
     elif shutil.which("aplay"):
         player = ["aplay", "-q", str(path)]
     elif shutil.which("ffplay"):
         player = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(path)]
 
     if not player:
-        logger.error("Aucun lecteur audio trouvé (soundfile, mpg123, aplay, ffplay)")
+        logger.error("Aucun lecteur audio trouvé (paplay, mpg123, aplay, ffplay)")
         return
 
     try:
@@ -138,5 +170,3 @@ def play_audio(audio_path: str) -> None:
         logger.error("Timeout lecture audio")
     except subprocess.CalledProcessError:
         logger.exception(f"Erreur lecture audio : {audio_path}")
-    except Exception:
-        logger.exception("Erreur inattendue lecture audio")

@@ -26,15 +26,25 @@ class Settings(BaseSettings):
     whisper_language: str = "fr"
 
     # TTS
-    tts_engine: Literal["edge", "coqui", "elevenlabs", "pyttsx3"] = "edge"
-    tts_voice: str = "fr-FR-HenriNeural"
+    tts_engine: Literal["edge", "coqui", "elevenlabs", "pyttsx3", "local"] = "edge"
+    tts_voice: str = "fr-FR-DeniseNeural"
+    tts_local_voice: str = "fr+f2"
+    tts_spd_voice_type: str = "female1"
+    tts_voice_gender: Literal["female", "male"] = "female"
+    tts_rate: int = 165
     speak_responses: bool = True
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = ""
 
     # Wake word
-    wake_word: str = "hey jarvis"
+    wake_word: str = "hey yadjios"
+    wake_word_phrases: str = "hey yadjios,ok yadjios,salut yadjios,hey yadji os"
     wake_word_sensitivity: float = 0.5
+    wake_greeting: str = "Oui ? Que puis-je faire pour vous ?"
+    startup_greeting_enabled: bool = True
+    startup_greeting: str = (
+        "Bonjour {user_name}, je suis {jarvis_name}. Comment puis-je vous aider ?"
+    )
 
     # Audio
     audio_sample_rate: int = 16000

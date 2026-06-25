@@ -26,7 +26,7 @@ class JarvisPipeline:
         self.audio = None if text_only else AudioCapture()
         self.stt = None if text_only else get_stt_engine()
         self.agent = get_jarvis_agent(minimal=text_only)
-        self.tts = None if text_only else get_tts_engine()
+        self.tts = None if text_only else get_tts_engine(reload=True)
         self.wake_word = None if text_only else get_wake_word_detector()
         self.long_term = None if text_only else get_long_term_memory()
         self.is_running = False
@@ -52,19 +52,37 @@ class JarvisPipeline:
             self.tts.speak(response)
         return response
 
-    def _handle_interaction(self, vocal: bool = True) -> None:
+    def _greet_after_wake(self) -> None:
+        """Accueil vocal après activation."""
+        greeting = settings.wake_greeting.strip()
+        if not greeting:
+            return
+        console.print(f"[bold green][{settings.jarvis_name}]:[/bold green] {greeting}")
+        self.tts.speak(greeting)
+
+    def _handle_interaction(self, vocal: bool = True, *, after_wake: bool = False) -> None:
         """Gère un cycle complet d'interaction."""
+        if after_wake:
+            self._greet_after_wake()
+
         if vocal:
             self.audio.play_beep()
             audio = self.audio.record_until_silence()
-            if len(audio) == 0:
+            if len(audio) == 0 or not self.audio.last_speech_detected:
+                console.print(
+                    "[yellow]Parole non détectée — parlez juste après le bip.[/yellow]"
+                )
                 return
             text = self.stt.transcribe(audio)
         else:
             text = input("\n[Vous]: ").strip()
 
-        if not text or len(text.split()) < 3:
-            logger.debug("Texte trop court, retour en écoute")
+        if not text:
+            console.print("[yellow]Rien entendu — réessayez après le bip.[/yellow]")
+            return
+
+        if len(text.split()) < 2:
+            console.print("[yellow]Phrase trop courte — réessayez.[/yellow]")
             return
 
         console.print(f"[bold cyan][Vous]:[/bold cyan] {text}")
@@ -84,7 +102,7 @@ class JarvisPipeline:
                 detected = self.wake_word.wait_for_wake_word(debug_stdin=self.debug)
                 if not detected:
                     break
-                self._handle_interaction(vocal=True)
+                self._handle_interaction(vocal=True, after_wake=True)
             except KeyboardInterrupt:
                 logger.info("Arrêt demandé par l'utilisateur")
                 break
@@ -110,7 +128,10 @@ class JarvisPipeline:
                 )
                 if not detected:
                     break
-                await loop.run_in_executor(None, self._handle_interaction, True)
+                await loop.run_in_executor(
+                    None,
+                    lambda: self._handle_interaction(vocal=True, after_wake=True),
+                )
             except asyncio.CancelledError:
                 break
             except Exception:

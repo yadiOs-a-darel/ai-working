@@ -1,18 +1,23 @@
+# Modèle — régénéré par make install-service (scripts/install.sh)
 [Unit]
-Description=JARVIS AI Assistant
-After=network.target ollama.service
+Description=YadjiOs AI Assistant
+After=network-online.target sound.target ollama.service
 Wants=ollama.service
+ConditionPathExists=/run/user/%U
 
 [Service]
 Type=simple
 User=%i
-WorkingDirectory=/home/%i/jarvis
-ExecStart=/home/%i/jarvis/.venv/bin/python main.py --mode all
+WorkingDirectory=%h/Documents/PROJET-AI/JARVIS-AI-BOT
+ExecStart=/bin/bash %h/Documents/PROJET-AI/JARVIS-AI-BOT/scripts/run.sh python %h/Documents/PROJET-AI/JARVIS-AI-BOT/main.py --mode voice
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
 Environment=PYTHONUNBUFFERED=1
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=PULSE_SERVER=unix:/run/user/%U/pulse/native
+# CONDA_PREFIX et PATH sont injectés par install.sh
 
 [Install]
 WantedBy=multi-user.target

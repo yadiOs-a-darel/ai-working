@@ -2,7 +2,10 @@
 
 import asyncio
 import re
+import shutil
+import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -12,6 +15,19 @@ from config.settings import settings
 from core.audio import play_audio
 
 _tts_instance: Optional["TTSEngine"] = None
+# Moteur verrouillé après la 1re phrase réussie — évite edge puis espeak (voix différentes)
+_session_engine: Optional[str] = None
+
+FEMININE_EDGE_VOICES = frozenset({
+    "fr-FR-DeniseNeural",
+    "fr-FR-EloiseNeural",
+    "fr-FR-VivienneMultilingualNeural",
+    "fr-BE-CharlineNeural",
+    "fr-CA-SylvieNeural",
+    "fr-CH-ArianeNeural",
+})
+EDGE_RETRY_ATTEMPTS = 3
+EDGE_RETRY_DELAY_S = 0.6
 
 EMOJI_PATTERN = re.compile(
     "["
@@ -67,15 +83,46 @@ def split_text_for_tts(text: str, max_chars: int = 500) -> list[str]:
 class TTSEngine:
     def __init__(self) -> None:
         self.engine = settings.tts_engine
-        self.voice = settings.tts_voice
-        self._pyttsx3_engine = None
+        self.voice = self._resolve_edge_voice()
+        self.rate = settings.tts_rate
+        self._feminine_edge_only = (
+            settings.tts_voice_gender == "female" and self.engine == "edge"
+        )
 
-    def _init_pyttsx3(self) -> None:
-        if self._pyttsx3_engine is None:
-            import pyttsx3
+    def _resolve_edge_voice(self) -> str:
+        voice = settings.tts_voice
+        if settings.tts_voice_gender != "female":
+            return voice
+        if voice in FEMININE_EDGE_VOICES:
+            return voice
+        if any(
+            name in voice
+            for name in ("Denise", "Eloise", "Vivienne", "Charline", "Sylvie", "Ariane")
+        ):
+            return voice
+        logger.warning(
+            f"Voix edge « {voice} » non féminine — bascule sur fr-FR-DeniseNeural"
+        )
+        return "fr-FR-DeniseNeural"
 
-            self._pyttsx3_engine = pyttsx3.init()
-            self._pyttsx3_engine.setProperty("rate", 170)
+    def _lock_engine(self, engine: str) -> None:
+        global _session_engine
+        if _session_engine is None:
+            _session_engine = engine
+            label = self.voice if engine == "edge" else engine
+            logger.info(f"Voix verrouillée pour la session : {engine} / {label}")
+
+    def _engines_to_try(self) -> list[str]:
+        global _session_engine
+        if _session_engine:
+            return [_session_engine]
+        if self._feminine_edge_only:
+            return ["edge"]
+        if self.engine == "edge":
+            return ["edge"]
+        if self.engine == "local":
+            return ["edge"]
+        return [self.engine, "edge"]
 
     async def _synthesize_edge(self, text: str, output_path: str) -> None:
         import edge_tts
@@ -84,118 +131,78 @@ class TTSEngine:
         await communicate.save(output_path)
 
     def _synthesize_edge_sync(self, text: str, output_path: str) -> None:
-        asyncio.run(self._synthesize_edge(text, output_path))
+        last_error: Exception | None = None
+        for attempt in range(1, EDGE_RETRY_ATTEMPTS + 1):
+            try:
+                asyncio.run(self._synthesize_edge(text, output_path))
+                path = Path(output_path)
+                if path.exists() and path.stat().st_size > 0:
+                    return
+                raise RuntimeError("Fichier edge-tts vide")
+            except Exception as exc:
+                last_error = exc
+                if attempt < EDGE_RETRY_ATTEMPTS:
+                    logger.warning(
+                        f"edge-tts tentative {attempt}/{EDGE_RETRY_ATTEMPTS} : {exc}"
+                    )
+                    time.sleep(EDGE_RETRY_DELAY_S)
+        raise RuntimeError(
+            f"edge-tts indisponible après {EDGE_RETRY_ATTEMPTS} tentatives : {last_error}"
+        ) from last_error
 
-    def _synthesize_pyttsx3(self, text: str, output_path: str) -> None:
-        self._init_pyttsx3()
-        self._pyttsx3_engine.save_to_file(text, output_path)
-        self._pyttsx3_engine.runAndWait()
-
-    def _synthesize_coqui(self, text: str, output_path: str) -> None:
+    def _play_chunk(self, text: str, engine: str) -> None:
+        suffix = ".mp3" if engine == "edge" else ".wav"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+        audio_path = tmp_path
         try:
-            from TTS.api import TTS
+            if engine == "edge":
+                audio_path = str(Path(tmp_path).with_suffix(".mp3"))
+                self._synthesize_edge_sync(text, audio_path)
+            else:
+                raise RuntimeError(f"Moteur non supporté : {engine}")
+            play_audio(audio_path)
+            self._lock_engine(engine)
+        finally:
+            Path(audio_path).unlink(missing_ok=True)
 
-            tts = TTS(model_name="tts_models/fr/css10/vits", progress_bar=False)
-            tts.tts_to_file(text=text, file_path=output_path)
-        except ImportError:
-            logger.warning("Coqui TTS non installé, fallback pyttsx3")
-            self._synthesize_pyttsx3(text, output_path)
-
-    def _synthesize_elevenlabs(self, text: str, output_path: str) -> None:
-        import requests
-
-        if not settings.elevenlabs_api_key or not settings.elevenlabs_voice_id:
-            raise ValueError("Clés ElevenLabs non configurées")
-
-        url = (
-            f"https://api.elevenlabs.io/v1/text-to-speech/"
-            f"{settings.elevenlabs_voice_id}"
-        )
-        headers = {
-            "Accept": "audio/mpeg",
-            "Content-Type": "application/json",
-            "xi-api-key": settings.elevenlabs_api_key,
-        }
-        response = requests.post(
-            url,
-            json={"text": text, "model_id": "eleven_multilingual_v2"},
-            headers=headers,
-            timeout=30,
-        )
-        response.raise_for_status()
-        Path(output_path).write_bytes(response.content)
-
-    def synthesize(self, text: str, output_path: str) -> None:
+    def synthesize(self, text: str, output_path: str) -> str:
         """Synthétise le texte vers un fichier audio."""
         cleaned = clean_text_for_tts(text)
         if not cleaned:
             logger.warning("Texte vide après nettoyage TTS")
-            return
-
-        chunks = split_text_for_tts(cleaned)
-        if len(chunks) == 1:
-            self._synthesize_chunk(chunks[0], output_path)
-            return
-
-        # Plusieurs morceaux : synthétiser le premier chunk principal
-        combined_path = Path(output_path)
-        temp_files: list[Path] = []
-        try:
-            for i, chunk in enumerate(chunks):
-                tmp = combined_path.parent / f"{combined_path.stem}_part{i}.wav"
-                self._synthesize_chunk(chunk, str(tmp))
-                temp_files.append(tmp)
-
-            if len(temp_files) == 1:
-                temp_files[0].rename(output_path)
-            else:
-                # Jouer séquentiellement via speak pour les chunks multiples
-                import shutil
-
-                shutil.copy(str(temp_files[0]), output_path)
-        finally:
-            for tmp in temp_files:
-                if tmp.exists() and str(tmp) != output_path:
-                    tmp.unlink(missing_ok=True)
-
-    def _synthesize_chunk(self, text: str, output_path: str) -> None:
-        try:
-            if self.engine == "edge":
-                self._synthesize_edge_sync(text, output_path)
-            elif self.engine == "pyttsx3":
-                self._synthesize_pyttsx3(text, output_path)
-            elif self.engine == "coqui":
-                self._synthesize_coqui(text, output_path)
-            elif self.engine == "elevenlabs":
-                self._synthesize_elevenlabs(text, output_path)
-            else:
-                self._synthesize_edge_sync(text, output_path)
-        except Exception:
-            logger.exception(f"Erreur TTS ({self.engine}), fallback edge-tts")
-            self._synthesize_edge_sync(text, output_path)
+            return output_path
+        target = str(Path(output_path).with_suffix(".mp3"))
+        self._synthesize_edge_sync(cleaned, target)
+        self._lock_engine("edge")
+        return target
 
     def speak(self, text: str) -> None:
-        """Synthétise et joue immédiatement."""
+        """Synthétise et joue — une seule voix (Denise) pour toute la session."""
         cleaned = clean_text_for_tts(text)
         if not cleaned:
             return
 
-        chunks = split_text_for_tts(cleaned)
-        for chunk in chunks:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp_path = tmp.name
-            try:
-                self.synthesize(chunk, tmp_path)
-                play_audio(tmp_path)
-            except Exception:
-                logger.exception("Erreur lecture réponse vocale")
-            finally:
-                Path(tmp_path).unlink(missing_ok=True)
+        engines = self._engines_to_try()
+        for chunk in split_text_for_tts(cleaned, max_chars=300):
+            spoken = False
+            for engine in engines:
+                try:
+                    self._play_chunk(chunk, engine)
+                    spoken = True
+                    break
+                except Exception as exc:
+                    logger.warning(f"TTS {engine} échoué : {exc}")
+            if not spoken:
+                logger.error(
+                    "Impossible de lire à voix haute — vérifiez la connexion "
+                    "(edge-tts / Denise) et mpg123 : sudo apt install mpg123"
+                )
 
 
-def get_tts_engine() -> TTSEngine:
-    """Singleton TTS."""
+def get_tts_engine(*, reload: bool = False) -> TTSEngine:
+    """Singleton TTS — le verrou de voix (_session_engine) survit au reload."""
     global _tts_instance
-    if _tts_instance is None:
+    if reload or _tts_instance is None:
         _tts_instance = TTSEngine()
     return _tts_instance

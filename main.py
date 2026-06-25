@@ -114,17 +114,21 @@ def print_startup_status(mode: str = "voice") -> None:
         tts = get_tts_engine()
         speak_label = "activée" if settings.speak_responses else "désactivée"
         console.print(
-            f"[green][✓][/green] TTS prêt : {settings.tts_engine}-tts "
-            f"({settings.tts_voice}) — lecture {speak_label}"
+            f"[green][✓][/green] TTS prêt : {settings.tts_engine} "
+            f"({settings.tts_voice}, {settings.tts_voice_gender}) — lecture {speak_label}"
         )
 
         from core.wake_word import get_wake_word_detector
 
         wake = get_wake_word_detector()
         if wake.is_active:
-            console.print(f'[green][✓][/green] Wake word actif : "{settings.wake_word}"')
+            console.print(
+                f'[green][✓][/green] Wake word actif : "{settings.wake_word}"'
+            )
         else:
-            console.print("[yellow][!][/yellow] Wake word : mode manuel (Entrée)")
+            console.print(
+                f'[green][✓][/green] Écoute vocale : dites « {settings.wake_word} »'
+            )
 
     if info["ollama_available"]:
         with console.status("[dim]Chargement du modèle en RAM...[/dim]", spinner="dots"):
@@ -149,9 +153,30 @@ def print_startup_status(mode: str = "voice") -> None:
     console.print("[bold]━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold]\n")
 
 
+def play_startup_greeting(mode: str) -> None:
+    """Message d'accueil au démarrage (console + voix en mode vocal)."""
+    if not settings.startup_greeting_enabled:
+        return
+    greeting = settings.startup_greeting.format(
+        user_name=settings.user_name,
+        jarvis_name=settings.jarvis_name,
+    ).strip()
+    if not greeting:
+        return
+    console.print(f"[bold green][{settings.jarvis_name}]:[/bold green] {greeting}")
+    if mode in ("voice", "all") and settings.speak_responses:
+        try:
+            from core.tts import get_tts_engine
+
+            get_tts_engine(reload=True).speak(greeting)
+        except Exception:
+            logger.warning("Accueil vocal ignoré (TTS indisponible)")
+
+
 def run_voice(debug: bool) -> None:
     from core.pipeline import get_pipeline
 
+    play_startup_greeting("voice")
     pipeline = get_pipeline(debug=debug)
     pipeline.run()
 
@@ -234,6 +259,7 @@ def run_ui() -> None:
 
 
 def run_all(debug: bool) -> None:
+    play_startup_greeting("all")
     api_thread = threading.Thread(
         target=run_api, args=(debug,), daemon=True, name="api"
     )

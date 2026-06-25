@@ -136,8 +136,8 @@ class JarvisAgent:
                 if tools_used:
                     logger.info(f"Outils utilisés : {tools_used}")
             else:
-                compact_prompt = get_compact_system_prompt(context)
-                response = self._simple_chat(user_input, compact_prompt)
+                compact_prompt = get_compact_system_prompt(context, vocal_mode)
+                response = self._simple_chat(user_input, compact_prompt, vocal_mode)
 
             duration = (time.perf_counter() - start) * 1000
             logger.info(f"Réponse générée en {duration:.0f}ms")
@@ -154,7 +154,9 @@ class JarvisAgent:
             logger.exception("Erreur agent, fallback LLM simple")
             try:
                 response = self._simple_chat(
-                    user_input, get_compact_system_prompt(context)
+                    user_input,
+                    get_compact_system_prompt(context, vocal_mode),
+                    vocal_mode,
                 )
                 self.memory.add_user_message(user_input)
                 self.memory.add_ai_message(response)
@@ -169,7 +171,7 @@ class JarvisAgent:
     ) -> Iterator[str]:
         """Stream la réponse token par token (mode chat simple uniquement)."""
         context = self._memory_context(user_input)
-        compact_prompt = get_compact_system_prompt(context)
+        compact_prompt = get_compact_system_prompt(context, vocal_mode)
         messages = self._build_chat_messages(user_input, compact_prompt)
         num_predict = estimate_num_predict(user_input)
 
@@ -202,9 +204,13 @@ class JarvisAgent:
         messages.append({"role": "user", "content": user_input})
         return messages
 
-    def _simple_chat(self, user_input: str, system_prompt: str) -> str:
+    def _simple_chat(
+        self, user_input: str, system_prompt: str, vocal_mode: bool = False
+    ) -> str:
         messages = self._build_chat_messages(user_input, system_prompt)
-        num_predict = estimate_num_predict(user_input)
+        num_predict = estimate_num_predict(
+            user_input, cap=64 if vocal_mode else None
+        )
         return self.llm_client.chat_local(messages, num_predict=num_predict)
 
     def chat_stream(self, user_input: str) -> Iterator[str]:
