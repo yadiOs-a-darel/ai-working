@@ -38,7 +38,10 @@ class Settings(BaseSettings):
 
     # Wake word
     wake_word: str = "hey yadjios"
-    wake_word_phrases: str = "hey yadjios,ok yadjios,salut yadjios,hey yadji os"
+    wake_word_phrases: str = (
+        "hey yadjios,bonjour yadjios,salut yadjios,ok yadjios,"
+        "hey yadji os,bonjour yadji os"
+    )
     wake_word_sensitivity: float = 0.5
     wake_greeting: str = "Oui ? Que puis-je faire pour vous ?"
     startup_greeting_enabled: bool = True

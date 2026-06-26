@@ -62,6 +62,20 @@ class JarvisPipeline:
 
     def _handle_interaction(self, vocal: bool = True, *, after_wake: bool = False) -> None:
         """Gère un cycle complet d'interaction."""
+        pending = ""
+        if after_wake and self.wake_word:
+            pending = self.wake_word.pop_pending_command()
+
+        if pending and len(pending.split()) >= 2:
+            console.print(f"[bold cyan][Vous]:[/bold cyan] {pending}")
+            response = self.agent.chat(pending, vocal_mode=vocal)
+            console.print(
+                f"[bold green][{settings.jarvis_name}]:[/bold green] {response}"
+            )
+            if vocal:
+                self.tts.speak(response)
+            return
+
         if after_wake:
             self._greet_after_wake()
 

@@ -15,8 +15,8 @@ from config.settings import settings
 from core.audio import play_audio
 
 _tts_instance: Optional["TTSEngine"] = None
-# Moteur verrouillé après la 1re phrase réussie — évite edge puis espeak (voix différentes)
 _session_engine: Optional[str] = None
+_edge_available: Optional[bool] = None
 
 FEMININE_EDGE_VOICES = frozenset({
     "fr-FR-DeniseNeural",
@@ -26,8 +26,8 @@ FEMININE_EDGE_VOICES = frozenset({
     "fr-CA-SylvieNeural",
     "fr-CH-ArianeNeural",
 })
-EDGE_RETRY_ATTEMPTS = 3
-EDGE_RETRY_DELAY_S = 0.6
+EDGE_RETRY_ATTEMPTS = 2
+EDGE_RETRY_DELAY_S = 0.5
 
 EMOJI_PATTERN = re.compile(
     "["
@@ -45,7 +45,6 @@ MARKDOWN_PATTERN = re.compile(r"[*_`#\[\]()>|~-]+")
 
 
 def clean_text_for_tts(text: str) -> str:
-    """Nettoie le texte avant synthèse vocale."""
     text = EMOJI_PATTERN.sub("", text)
     text = HTML_PATTERN.sub("", text)
     text = MARKDOWN_PATTERN.sub("", text)
@@ -54,7 +53,6 @@ def clean_text_for_tts(text: str) -> str:
 
 
 def split_text_for_tts(text: str, max_chars: int = 500) -> list[str]:
-    """Découpe le texte aux ponctuations si trop long."""
     if len(text) <= max_chars:
         return [text]
 
@@ -84,10 +82,8 @@ class TTSEngine:
     def __init__(self) -> None:
         self.engine = settings.tts_engine
         self.voice = self._resolve_edge_voice()
+        self.local_voice = settings.tts_local_voice
         self.rate = settings.tts_rate
-        self._feminine_edge_only = (
-            settings.tts_voice_gender == "female" and self.engine == "edge"
-        )
 
     def _resolve_edge_voice(self) -> str:
         voice = settings.tts_voice
@@ -100,39 +96,65 @@ class TTSEngine:
             for name in ("Denise", "Eloise", "Vivienne", "Charline", "Sylvie", "Ariane")
         ):
             return voice
-        logger.warning(
-            f"Voix edge « {voice} » non féminine — bascule sur fr-FR-DeniseNeural"
-        )
         return "fr-FR-DeniseNeural"
 
     def _lock_engine(self, engine: str) -> None:
         global _session_engine
         if _session_engine is None:
             _session_engine = engine
-            label = self.voice if engine == "edge" else engine
+            if engine == "edge":
+                label = self.voice
+            elif engine == "espeak":
+                label = self.local_voice
+            else:
+                label = engine
             logger.info(f"Voix verrouillée pour la session : {engine} / {label}")
+
+    def _check_edge_available(self) -> bool:
+        """Test rapide edge-tts (Microsoft bloque souvent avec 403)."""
+        global _edge_available
+        if _edge_available is not None:
+            return _edge_available
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            path = tmp.name
+        try:
+            self._synthesize_edge_sync("ok", path, retries=1)
+            _edge_available = True
+            return True
+        except Exception as exc:
+            _edge_available = False
+            logger.warning(
+                f"edge-tts indisponible ({exc}) — repli voix féminine locale "
+                f"espeak ({self.local_voice})"
+            )
+            return False
+        finally:
+            Path(path).unlink(missing_ok=True)
 
     def _engines_to_try(self) -> list[str]:
         global _session_engine
         if _session_engine:
             return [_session_engine]
-        if self._feminine_edge_only:
-            return ["edge"]
-        if self.engine == "edge":
-            return ["edge"]
-        if self.engine == "local":
-            return ["edge"]
-        return [self.engine, "edge"]
+
+        chain: list[str] = []
+        if self.engine == "edge" and self._check_edge_available():
+            chain.append("edge")
+        if shutil.which("espeak-ng") or shutil.which("espeak"):
+            chain.append("espeak")
+        if not chain:
+            chain = ["edge"]
+        return chain
 
     async def _synthesize_edge(self, text: str, output_path: str) -> None:
         import edge_tts
 
-        communicate = edge_tts.Communicate(text, self.voice)
-        await communicate.save(output_path)
+        await edge_tts.Communicate(text, self.voice).save(output_path)
 
-    def _synthesize_edge_sync(self, text: str, output_path: str) -> None:
+    def _synthesize_edge_sync(
+        self, text: str, output_path: str, retries: int = EDGE_RETRY_ATTEMPTS
+    ) -> None:
         last_error: Exception | None = None
-        for attempt in range(1, EDGE_RETRY_ATTEMPTS + 1):
+        for attempt in range(1, retries + 1):
             try:
                 asyncio.run(self._synthesize_edge(text, output_path))
                 path = Path(output_path)
@@ -141,14 +163,19 @@ class TTSEngine:
                 raise RuntimeError("Fichier edge-tts vide")
             except Exception as exc:
                 last_error = exc
-                if attempt < EDGE_RETRY_ATTEMPTS:
-                    logger.warning(
-                        f"edge-tts tentative {attempt}/{EDGE_RETRY_ATTEMPTS} : {exc}"
-                    )
+                if attempt < retries:
                     time.sleep(EDGE_RETRY_DELAY_S)
-        raise RuntimeError(
-            f"edge-tts indisponible après {EDGE_RETRY_ATTEMPTS} tentatives : {last_error}"
-        ) from last_error
+        raise RuntimeError(f"edge-tts : {last_error}") from last_error
+
+    def _synthesize_espeak_ng(self, text: str, output_path: str) -> None:
+        espeak = shutil.which("espeak-ng") or shutil.which("espeak")
+        if not espeak:
+            raise RuntimeError("espeak-ng introuvable — sudo apt install espeak-ng")
+        subprocess.run(
+            [espeak, "-v", self.local_voice, "-s", str(self.rate), "-w", output_path, text],
+            check=True,
+            timeout=120,
+        )
 
     def _play_chunk(self, text: str, engine: str) -> None:
         suffix = ".mp3" if engine == "edge" else ".wav"
@@ -159,50 +186,44 @@ class TTSEngine:
             if engine == "edge":
                 audio_path = str(Path(tmp_path).with_suffix(".mp3"))
                 self._synthesize_edge_sync(text, audio_path)
+            elif engine == "espeak":
+                self._synthesize_espeak_ng(text, audio_path)
             else:
-                raise RuntimeError(f"Moteur non supporté : {engine}")
+                raise RuntimeError(f"Moteur inconnu : {engine}")
             play_audio(audio_path)
             self._lock_engine(engine)
         finally:
             Path(audio_path).unlink(missing_ok=True)
 
-    def synthesize(self, text: str, output_path: str) -> str:
-        """Synthétise le texte vers un fichier audio."""
-        cleaned = clean_text_for_tts(text)
-        if not cleaned:
-            logger.warning("Texte vide après nettoyage TTS")
-            return output_path
-        target = str(Path(output_path).with_suffix(".mp3"))
-        self._synthesize_edge_sync(cleaned, target)
-        self._lock_engine("edge")
-        return target
-
     def speak(self, text: str) -> None:
-        """Synthétise et joue — une seule voix (Denise) pour toute la session."""
+        """Synthétise et joue — une voix verrouillée par session (edge ou espeak)."""
         cleaned = clean_text_for_tts(text)
         if not cleaned:
             return
 
-        engines = self._engines_to_try()
         for chunk in split_text_for_tts(cleaned, max_chars=300):
             spoken = False
-            for engine in engines:
+            for engine in self._engines_to_try():
                 try:
                     self._play_chunk(chunk, engine)
                     spoken = True
                     break
                 except Exception as exc:
                     logger.warning(f"TTS {engine} échoué : {exc}")
+                    if engine == "edge":
+                        global _edge_available
+                        _edge_available = False
             if not spoken:
                 logger.error(
-                    "Impossible de lire à voix haute — vérifiez la connexion "
-                    "(edge-tts / Denise) et mpg123 : sudo apt install mpg123"
+                    "Impossible de lire à voix haute — installez : "
+                    "sudo apt install espeak-ng mpg123"
                 )
 
 
 def get_tts_engine(*, reload: bool = False) -> TTSEngine:
-    """Singleton TTS — le verrou de voix (_session_engine) survit au reload."""
-    global _tts_instance
+    global _tts_instance, _edge_available
+    if reload:
+        _edge_available = None
     if reload or _tts_instance is None:
         _tts_instance = TTSEngine()
     return _tts_instance

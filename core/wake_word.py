@@ -12,6 +12,10 @@ from config.settings import settings
 
 _wake_word_instance: Optional["WakeWordDetector"] = None
 
+_WAKE_GREETING_PREFIXES = (
+    "hey", "ok", "salut", "bonjour", "bonsoir", "coucou", "dis", "dit",
+)
+
 
 def _normalize_phrase(text: str) -> str:
     text = text.lower().strip()
@@ -21,6 +25,15 @@ def _normalize_phrase(text: str) -> str:
     return " ".join(text.split())
 
 
+def _is_meaningful_transcript(text: str) -> bool:
+    cleaned = text.strip().strip(".…")
+    if len(cleaned) < 2:
+        return False
+    if cleaned.replace(".", "").replace(" ", "") == "":
+        return False
+    return len(cleaned.split()) >= 1
+
+
 class WakeWordDetector:
     def __init__(self) -> None:
         self.wake_word = settings.wake_word.lower()
@@ -28,6 +41,7 @@ class WakeWordDetector:
         self.sample_rate = settings.audio_sample_rate
         self._phrases = self._load_phrases()
         self._name_token = _normalize_phrase(settings.jarvis_name)
+        self._pending_command: str = ""
         self._model = None
         self._active = False
         self._init_model()
@@ -40,12 +54,18 @@ class WakeWordDetector:
             phrases.insert(0, primary)
         return phrases
 
+    def pop_pending_command(self) -> str:
+        """Commande prononcée dans la même phrase que le wake word."""
+        cmd = self._pending_command.strip()
+        self._pending_command = ""
+        return cmd
+
     def _init_model(self) -> None:
         wake_normalized = _normalize_phrase(settings.wake_word)
         if "jarvis" not in wake_normalized:
             logger.info(
                 f"Écoute vocale STT : « {settings.wake_word} » "
-                f"(OpenWakeWord réservé à « hey jarvis »)"
+                f"(dites le nom {settings.jarvis_name})"
             )
             self._model = None
             return
@@ -59,7 +79,7 @@ class WakeWordDetector:
             logger.info(f"Wake word OpenWakeWord actif : \"{settings.wake_word}\"")
         except Exception:
             logger.warning(
-                f"OpenWakeWord indisponible — écoute vocale « {settings.wake_word} » via micro"
+                f"OpenWakeWord indisponible — écoute vocale « {settings.wake_word} »"
             )
             self._model = None
 
@@ -67,24 +87,61 @@ class WakeWordDetector:
     def is_active(self) -> bool:
         return self._model is not None
 
-    def _matches_wake_phrase(self, transcript: str) -> bool:
-        normalized = _normalize_phrase(transcript)
+    def _contains_assistant_name(self, normalized: str) -> bool:
         if not normalized:
             return False
+        if self._name_token and self._name_token in normalized:
+            return True
+        compact = normalized.replace(" ", "")
+        return "yadjios" in compact or "yadji" in normalized.split()
+
+    def _extract_command(self, normalized: str) -> str:
+        """Texte après le nom de l'assistant dans la même phrase."""
+        if not self._contains_assistant_name(normalized):
+            return ""
+
+        for phrase in sorted(self._phrases, key=len, reverse=True):
+            if normalized.startswith(phrase):
+                rest = normalized[len(phrase) :].strip(" ,.?!")
+                if len(rest.split()) >= 2:
+                    return rest
+
+        if self._name_token and self._name_token in normalized:
+            idx = normalized.find(self._name_token)
+            rest = normalized[idx + len(self._name_token) :].strip(" ,.?!")
+        else:
+            match = re.search(r"yadji\s*os?", normalized)
+            if not match:
+                return ""
+            rest = normalized[match.end() :].strip(" ,.?!")
+
+        if len(rest.split()) >= 2:
+            return rest
+        return ""
+
+    def parse_wake_transcript(self, transcript: str) -> tuple[bool, str]:
+        """Retourne (wake détecté, commande éventuelle dans la même phrase)."""
+        normalized = _normalize_phrase(transcript)
+        if not normalized:
+            return False, ""
+
         for phrase in self._phrases:
             if phrase in normalized or normalized.startswith(phrase):
-                return True
-            # « hey yadjios quelle heure » → commande juste après le wake word
-            if (
-                self._name_token
-                and normalized.startswith(phrase.split()[0])
-                and self._name_token in normalized
-            ):
-                return True
-        return False
+                return True, self._extract_command(normalized)
+
+        if self._contains_assistant_name(normalized):
+            for prefix in _WAKE_GREETING_PREFIXES:
+                if normalized.startswith(prefix) or f"{prefix} " in normalized:
+                    return True, self._extract_command(normalized)
+            # « YadjiOs, qu'est-ce qu'une API ? »
+            if normalized.startswith(self._name_token or "yadji"):
+                return True, self._extract_command(normalized)
+            # Nom présent n'importe où : « dis à YadjiOs ... » ou phrase mixte
+            return True, self._extract_command(normalized)
+
+        return False, ""
 
     def detect_in_audio(self, audio_chunk: np.ndarray) -> bool:
-        """Détecte le wake word dans un chunk audio (OpenWakeWord)."""
         if self._model is None or len(audio_chunk) == 0:
             return False
         try:
@@ -98,8 +155,8 @@ class WakeWordDetector:
             logger.exception("Erreur détection wake word")
             return False
 
-    def _record_phrase(self, max_duration: float = 4.0) -> np.ndarray:
-        """Capture une courte phrase (parole puis silence)."""
+    def _record_phrase(self, max_duration: float = 6.0) -> np.ndarray:
+        """Capture une phrase (parole puis silence)."""
         chunk_duration = settings.audio_chunk_duration
         chunk_samples = int(self.sample_rate * chunk_duration)
         max_chunks = int(max_duration / chunk_duration)
@@ -109,7 +166,8 @@ class WakeWordDetector:
         silence_count = 0
         speech_detected = False
         silence_needed = max(1, int(settings.vad_silence_threshold / chunk_duration))
-        rms_threshold = 0.01
+        rms_threshold = 0.012
+        min_speech_chunks = max(2, int(1.0 / chunk_duration))
 
         with sd.InputStream(
             samplerate=self.sample_rate,
@@ -118,6 +176,7 @@ class WakeWordDetector:
             blocksize=chunk_samples,
             device=device,
         ) as stream:
+            speech_chunks = 0
             for _ in range(max_chunks):
                 chunk, _ = stream.read(chunk_samples)
                 chunk = chunk.flatten().astype(np.float32)
@@ -126,27 +185,30 @@ class WakeWordDetector:
                 if level >= rms_threshold:
                     speech_detected = True
                     silence_count = 0
+                    speech_chunks += 1
                 elif speech_detected:
                     silence_count += 1
-                    if silence_count >= silence_needed:
+                    if (
+                        silence_count >= silence_needed
+                        and speech_chunks >= min_speech_chunks
+                    ):
                         break
 
-        if not recorded or not speech_detected:
+        if not recorded or not speech_detected or speech_chunks < min_speech_chunks:
             return np.array([], dtype=np.float32)
         return np.concatenate(recorded)
 
     def _wait_stt_wake_word(self) -> bool:
-        """Écoute continue du micro jusqu'à entendre le wake word (ou variantes)."""
         from core.stt import get_stt_engine
 
         stt = get_stt_engine()
         logger.info(
-            f"Écoute active — dites « {settings.wake_word} » "
-            f"(Ctrl+C pour quitter)"
+            f"Écoute active — dites « {settings.wake_word} » ou "
+            f"« Bonjour {settings.jarvis_name} » (Ctrl+C pour quitter)"
         )
 
         while self._active:
-            audio = self._record_phrase(max_duration=5.0)
+            audio = self._record_phrase(max_duration=6.0)
             if len(audio) == 0:
                 continue
             try:
@@ -154,11 +216,18 @@ class WakeWordDetector:
             except Exception:
                 logger.exception("Erreur transcription wake word")
                 continue
-            if not transcript:
+            if not _is_meaningful_transcript(transcript):
+                logger.debug(f"Bruit ignoré : {transcript!r}")
                 continue
-            logger.debug(f"Écoute : {transcript[:80]}")
-            if self._matches_wake_phrase(transcript):
-                logger.info(f"Wake word détecté : {transcript}")
+
+            logger.info(f"Écoute : {transcript[:100]}")
+            matched, command = self.parse_wake_transcript(transcript)
+            if matched:
+                self._pending_command = command
+                logger.info(
+                    f"Wake word détecté : {transcript[:80]}"
+                    + (f" → commande : {command[:60]}" if command else "")
+                )
                 return True
 
         return False
@@ -168,7 +237,6 @@ class WakeWordDetector:
         callback: Optional[Callable[[], None]] = None,
         debug_stdin: bool = False,
     ) -> bool:
-        """Bloque jusqu'à détection du wake word."""
         if debug_stdin:
             try:
                 input("\n[DEBUG] Appuyez sur Entrée pour parler... ")
@@ -177,6 +245,7 @@ class WakeWordDetector:
                 return False
 
         self._active = True
+        self._pending_command = ""
 
         if self._model is not None:
             chunk_samples = int(self.sample_rate * settings.audio_chunk_duration)

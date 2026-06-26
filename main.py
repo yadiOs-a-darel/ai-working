@@ -113,10 +113,16 @@ def print_startup_status(mode: str = "voice") -> None:
 
         tts = get_tts_engine()
         speak_label = "activée" if settings.speak_responses else "désactivée"
-        console.print(
-            f"[green][✓][/green] TTS prêt : {settings.tts_engine} "
-            f"({settings.tts_voice}, {settings.tts_voice_gender}) — lecture {speak_label}"
-        )
+        if settings.tts_engine == "edge" and not tts._check_edge_available():
+            console.print(
+                f"[yellow][!][/yellow] edge-tts indisponible — repli espeak "
+                f"({settings.tts_local_voice}) — lecture {speak_label}"
+            )
+        else:
+            console.print(
+                f"[green][✓][/green] TTS prêt : {settings.tts_engine} "
+                f"({settings.tts_voice}, {settings.tts_voice_gender}) — lecture {speak_label}"
+            )
 
         from core.wake_word import get_wake_word_detector
 

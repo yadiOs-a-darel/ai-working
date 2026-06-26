@@ -63,7 +63,10 @@ class STTEngine:
             )
             text = " ".join(seg.text.strip() for seg in segments).strip()
             duration = time.perf_counter() - start
-            logger.info(f"Transcription ({duration:.2f}s) : {text[:80]}...")
+            if text and len(text.strip(".… ")) >= 2:
+                logger.info(f"Transcription ({duration:.2f}s) : {text[:80]}...")
+            else:
+                logger.debug(f"Transcription vide ({duration:.2f}s)")
             return text
         except Exception:
             logger.exception("Erreur transcription, nouvelle tentative...")
