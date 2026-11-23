@@ -1,6 +1,6 @@
 # YadjiOs — Assistant IA Vocal Personnel
 
-Assistant IA vocal inspiré de JARVIS (Iron Man), fonctionnant en local sur Linux avec Python 3.11–3.13.  
+Assistant IA vocal , fonctionnant en local sur Linux avec Python 3.11–3.13.  
 LLM via **Ollama**, reconnaissance vocale **faster-whisper**, synthèse **edge-tts** (avec repli local), wake word configurable.
 
 ## Fonctionnalités
